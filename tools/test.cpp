@@ -145,6 +145,30 @@ static void Info(const wchar_t* file) {
         ++n;
     }
     wprintf(L"quadros: %d, primeiro=%.3f ultimo=%.3f\n", n, first / 1e7, last / 1e7);
+    // áudio decodificado: soma das durações
+    ComPtr<IMFSourceReader> ar;
+    if (SUCCEEDED(MFCreateSourceReaderFromURL(file, nullptr, &ar))) {
+        ar->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        ar->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE);
+        ComPtr<IMFMediaType> pcm;
+        MFCreateMediaType(&pcm);
+        pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        ar->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, pcm.Get());
+        LONGLONG total = 0, a0 = -1;
+        for (;;) {
+            DWORD si, fl;
+            LONGLONG ts;
+            ComPtr<IMFSample> s;
+            if (FAILED(ar->ReadSample((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &si, &fl, &ts, &s)) || (fl & MF_SOURCE_READERF_ENDOFSTREAM)) break;
+            if (!s) continue;
+            if (a0 < 0) a0 = ts;
+            LONGLONG d = 0;
+            s->GetSampleDuration(&d);
+            total += d;
+        }
+        wprintf(L"audio decodificado: inicio=%.3f duracao=%.3f s\n", a0 / 1e7, total / 1e7);
+    }
 }
 
 #include <gdiplus.h>

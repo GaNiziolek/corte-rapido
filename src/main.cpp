@@ -326,8 +326,49 @@ static void OnEngineEvent(DWORD ev) {
 // ---------------------------------------------------------------------------
 // Exportação (Source Reader decodifica -> Sink Writer recodifica H.264/AAC em MP4)
 
+// Taxas de bits reais do original, medidas pelo tamanho do arquivo (o MF_MT_AVG_BITRATE
+// do MP4 nem sempre é confiável).
+struct SourceRates {
+    UINT32 video = 0;      // bps; 0 = desconhecido
+    UINT32 aacBytes = 0;   // bytes/s do AAC de saída
+    bool audioCopy = false;  // áudio já é AAC: copia sem recodificar
+};
+
+static SourceRates MeasureRates(const std::wstring& src, IMFSourceReader* reader, bool hasV, DWORD vIdx,
+                                bool hasA, DWORD aIdx) {
+    SourceRates r;
+    UINT32 audioBps = 0;
+    if (hasA) {
+        ComPtr<IMFMediaType> mt;
+        if (SUCCEEDED(reader->GetNativeMediaType(aIdx, 0, &mt)))
+            audioBps = MFGetAttributeUINT32(mt.Get(), MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 0) * 8;
+        if (!audioBps) audioBps = 128000;
+        // AAC do Windows aceita 96/128/160/192 kbps: o menor que não fica abaixo do original
+        static const UINT32 opts[] = {12000, 16000, 20000, 24000};
+        r.aacBytes = 24000;
+        for (UINT32 o : opts)
+            if (o * 8 >= audioBps * 0.95) { r.aacBytes = o; break; }
+    }
+    if (hasV) {
+        ComPtr<IMFMediaType> mt;
+        if (SUCCEEDED(reader->GetNativeMediaType(vIdx, 0, &mt))) r.video = MFGetAttributeUINT32(mt.Get(), MF_MT_AVG_BITRATE, 0);
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fa) &&
+            SUCCEEDED(reader->GetPresentationAttribute((DWORD)MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &v)) &&
+            v.vt == VT_UI8 && v.uhVal.QuadPart > 0) {
+            double bytes = (double)(((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+            double measured = bytes * 8 / (v.uhVal.QuadPart / 1e7) - audioBps;
+            if (measured > 0 && (!r.video || measured < r.video)) r.video = (UINT32)measured;
+        }
+        PropVariantClear(&v);
+    }
+    return r;
+}
+
 static HRESULT ConfigureWriter(const std::wstring& dst, bool hw, IMFSourceReader* reader,
-                               bool hasV, DWORD vIdx, bool& hasA, DWORD aIdx,
+                               bool hasV, DWORD vIdx, bool& hasA, DWORD aIdx, const SourceRates& rates,
                                ComPtr<IMFSinkWriter>& writer, DWORD& vOut, DWORD& aOut) {
     writer.Reset();
     ComPtr<IMFAttributes> wa;
@@ -349,12 +390,13 @@ static HRESULT ConfigureWriter(const std::wstring& dst, bool hw, IMFSourceReader
         if (FAILED(MFGetAttributeRatio(native.Get(), MF_MT_PIXEL_ASPECT_RATIO, &pn, &pd)) || !pn || !pd) { pn = pd = 1; }
 
         // Taxa de bits: a mesma do original (H.265 precisa de ~1.5x em H.264)
-        UINT32 bitrate = MFGetAttributeUINT32(native.Get(), MF_MT_AVG_BITRATE, 0);
+        UINT32 bitrate = rates.video;
         GUID sub = GUID_NULL;
         native->GetGUID(MF_MT_SUBTYPE, &sub);
         if (!bitrate) bitrate = (UINT32)std::min<double>(w * (double)h * ((double)fn / fd) * 0.15, 40e6);
         if (sub == MFVideoFormat_HEVC) bitrate = (UINT32)std::min<double>(bitrate * 1.5, 4e9);
-        bitrate = std::clamp<UINT32>(bitrate, 1500000, 100000000);
+        // Piso baixo: gravações de tela (OBS) costumam ter poucas centenas de kbps.
+        bitrate = std::clamp<UINT32>(bitrate, 100000, 100000000);
 
         MFCreateMediaType(&out);
         out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -370,10 +412,23 @@ static HRESULT ConfigureWriter(const std::wstring& dst, bool hw, IMFSourceReader
 
         hr = writer->AddStream(out.Get(), &vOut);
         if (FAILED(hr)) return hr;
-        hr = writer->SetInputMediaType(vOut, in.Get(), nullptr);
+        // VBR com média = taxa do original: cenas paradas gastam menos, movimento gasta mais.
+        ComPtr<IMFAttributes> enc;
+        MFCreateAttributes(&enc, 2);
+        enc->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
+        enc->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, bitrate);
+        hr = writer->SetInputMediaType(vOut, in.Get(), enc.Get());
+        if (FAILED(hr)) hr = writer->SetInputMediaType(vOut, in.Get(), nullptr);
         if (FAILED(hr)) return hr;
     }
 
+    if (hasA && rates.audioCopy) {
+        ComPtr<IMFMediaType> in;
+        hr = reader->GetCurrentMediaType(aIdx, &in);
+        if (SUCCEEDED(hr)) hr = writer->AddStream(in.Get(), &aOut);
+        if (SUCCEEDED(hr)) hr = writer->SetInputMediaType(aOut, in.Get(), nullptr);
+        return hr;
+    }
     if (hasA) {
         ComPtr<IMFMediaType> in, out;
         HRESULT ahr = reader->GetCurrentMediaType(aIdx, &in);
@@ -391,7 +446,7 @@ static HRESULT ConfigureWriter(const std::wstring& dst, bool hw, IMFSourceReader
             out->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
             out->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
             out->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, ch);
-            out->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);  // 192 kbps
+            out->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rates.aacBytes);
             ok = SUCCEEDED(writer->AddStream(out.Get(), &aOut)) &&
                  SUCCEEDED(writer->SetInputMediaType(aOut, in.Get(), nullptr));
         }
@@ -400,7 +455,7 @@ static HRESULT ConfigureWriter(const std::wstring& dst, bool hw, IMFSourceReader
             // Sem como recodificar o áudio: recomeça só com vídeo.
             hasA = false;
             reader->SetStreamSelection(aIdx, FALSE);
-            return ConfigureWriter(dst, hw, reader, hasV, vIdx, hasA, aIdx, writer, vOut, aOut);
+            return ConfigureWriter(dst, hw, reader, hasV, vIdx, hasA, aIdx, rates, writer, vOut, aOut);
         }
     }
     return S_OK;
@@ -436,11 +491,19 @@ static HRESULT ExportClip(const std::wstring& src, const std::wstring& dst, doub
         if (FAILED(hr)) return hr;
         reader->SetStreamSelection(vIdx, TRUE);
     }
-    if (hasA) {
-        ComPtr<IMFMediaType> native;
-        reader->GetNativeMediaType(aIdx, 0, &native);
-        UINT32 rate = MFGetAttributeUINT32(native.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
-        UINT32 ch = MFGetAttributeUINT32(native.Get(), MF_MT_AUDIO_NUM_CHANNELS, 2);
+    SourceRates rates = MeasureRates(src, reader.Get(), hasV, vIdx, hasA, aIdx);
+    ComPtr<IMFMediaType> nativeAudio;
+    if (hasA) reader->GetNativeMediaType(aIdx, 0, &nativeAudio);
+
+    // Áudio: AAC é copiado como está; outros formatos são decodificados p/ PCM e recodificados.
+    auto setupAudio = [&](bool copy) {
+        if (copy) {
+            GUID sub = GUID_NULL;
+            nativeAudio->GetGUID(MF_MT_SUBTYPE, &sub);
+            return sub == MFAudioFormat_AAC && SUCCEEDED(reader->SetCurrentMediaType(aIdx, nullptr, nativeAudio.Get()));
+        }
+        UINT32 rate = MFGetAttributeUINT32(nativeAudio.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        UINT32 ch = MFGetAttributeUINT32(nativeAudio.Get(), MF_MT_AUDIO_NUM_CHANNELS, 2);
         auto tryPcm = [&](UINT32 r, UINT32 c) {
             ComPtr<IMFMediaType> t;
             MFCreateMediaType(&t);
@@ -451,27 +514,30 @@ static HRESULT ExportClip(const std::wstring& src, const std::wstring& dst, doub
             if (c) t->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, c);
             return SUCCEEDED(reader->SetCurrentMediaType(aIdx, nullptr, t.Get()));
         };
-        UINT32 wantRate = (rate == 44100 || rate == 48000) ? rate : 48000;
-        UINT32 wantCh = ch > 2 ? 2 : ch;
-        if (tryPcm(wantRate, wantCh) || tryPcm(0, 0)) reader->SetStreamSelection(aIdx, TRUE);
-        else hasA = false;
-    }
-    if (!hasV && !hasA) return MF_E_INVALIDMEDIATYPE;
+        return tryPcm((rate == 44100 || rate == 48000) ? rate : 48000, ch > 2 ? 2 : ch) || tryPcm(0, 0);
+    };
 
+    // Tentativas em ordem: copiar áudio + H.264 por software (mais rápido sem GPU compartilhada),
+    // recodificar áudio, e por fim o encoder por hardware.
+    struct Attempt { bool copyAudio, hw; };
+    static const Attempt attempts[] = {{true, false}, {false, false}, {false, true}};
     ComPtr<IMFSinkWriter> writer;
     DWORD vOut = 0, aOut = 0;
-    bool hasA0 = hasA;
-    hr = ConfigureWriter(dst, true, reader.Get(), hasV, vIdx, hasA, aIdx, writer, vOut, aOut);
-    if (SUCCEEDED(hr)) hr = writer->BeginWriting();
-    if (FAILED(hr)) {
-        // Codificador por hardware recusou: tenta o de software.
-        hasA = hasA0;
-        if (hasA) reader->SetStreamSelection(aIdx, TRUE);
+    const bool hadAudio = hasA;
+    hr = E_FAIL;
+    for (const Attempt& at : attempts) {
+        hasA = hadAudio && setupAudio(at.copyAudio);
+        if (hadAudio && !hasA && at.copyAudio) continue;
+        if (!hasV && !hasA) return MF_E_INVALIDMEDIATYPE;
+        if (hadAudio) reader->SetStreamSelection(aIdx, hasA);
+        rates.audioCopy = at.copyAudio;
         writer.Reset();
-        hr = ConfigureWriter(dst, false, reader.Get(), hasV, vIdx, hasA, aIdx, writer, vOut, aOut);
+        DeleteFileW(dst.c_str());
+        hr = ConfigureWriter(dst, at.hw, reader.Get(), hasV, vIdx, hasA, aIdx, rates, writer, vOut, aOut);
         if (SUCCEEDED(hr)) hr = writer->BeginWriting();
-        if (FAILED(hr)) return hr;
+        if (SUCCEEDED(hr)) break;
     }
+    if (FAILED(hr)) return hr;
 
     const LONGLONG A = (LONGLONG)llround(a * 1e7), B = (LONGLONG)llround(b * 1e7);
     PROPVARIANT pos;
@@ -508,6 +574,7 @@ static HRESULT ExportClip(const std::wstring& src, const std::wstring& dst, doub
         }
         if (ts + dur <= A) continue;
         if (ts < A) {
+            if (!isV && rates.audioCopy) continue;  // pacote AAC não pode ser aparado
             s->SetSampleDuration(ts + dur - A);
             ts = A;
         }

@@ -17,7 +17,7 @@ Cortador de vídeo minimalista para Windows 10+. Um único `CorteRapido.exe` (~2
 | Esc | Limpar seleção (ou cancelar exportação) |
 | Ctrl+O / Ctrl+E | Abrir / exportar |
 
-O corte é preciso no quadro: o trecho é recodificado em H.264 + AAC (MP4), usando o encoder por hardware da GPU quando disponível, com taxa de bits igual à do original.
+O corte é preciso no quadro: o vídeo é recodificado em H.264 (MP4) com a mesma taxa de bits média do original (medida pelo tamanho do arquivo), então o corte fica proporcional em tamanho. Áudio AAC é copiado sem recodificar; outros formatos de áudio viram AAC.
 
 ## Compilar
 
