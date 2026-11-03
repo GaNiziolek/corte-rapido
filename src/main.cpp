@@ -417,6 +417,9 @@ static HRESULT ConfigureWriter(const std::wstring& dst, bool hw, IMFSourceReader
         MFCreateAttributes(&enc, 2);
         enc->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
         enc->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, bitrate);
+        // Quadro-chave a cada ~10 s. O padrão do encoder é bem mais curto e, nas taxas baixas de
+        // gravação de tela, os quadros-chave consomem quase tudo e o texto vira borrão.
+        enc->SetUINT32(CODECAPI_AVEncMPVGOPSize, std::clamp<UINT32>(10 * fn / fd, 1, 600));
         hr = writer->SetInputMediaType(vOut, in.Get(), enc.Get());
         if (FAILED(hr)) hr = writer->SetInputMediaType(vOut, in.Get(), nullptr);
         if (FAILED(hr)) return hr;
@@ -458,6 +461,69 @@ static HRESULT ConfigureWriter(const std::wstring& dst, bool hw, IMFSourceReader
             return ConfigureWriter(dst, hw, reader, hasV, vIdx, hasA, aIdx, rates, writer, vOut, aOut);
         }
     }
+    return S_OK;
+}
+
+// Layout real dos quadros NV12 que o decodificador entrega. O H.264 codifica em blocos de 16,
+// então 1080p chega como 1920x1088 (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED no 1º quadro).
+struct Nv12Layout {
+    UINT32 rows = 0;  // linhas do plano Y no buffer (altura codificada)
+    LONG stride = 0;  // bytes por linha; 0 = largura
+};
+
+static Nv12Layout ReadNv12Layout(IMFSourceReader* reader, DWORD vIdx) {
+    Nv12Layout l;
+    ComPtr<IMFMediaType> mt;
+    if (FAILED(reader->GetCurrentMediaType(vIdx, &mt))) return l;
+    UINT32 w = 0;
+    MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &w, &l.rows);
+    l.stride = (LONG)MFGetAttributeUINT32(mt.Get(), MF_MT_DEFAULT_STRIDE, w);
+    return l;
+}
+
+// Copia o quadro para um buffer NV12 compacto w x h, que é o que o encoder espera. Sem isso o
+// plano UV é lido 8 linhas antes do lugar (faixa verde no topo em vídeos 1080p).
+static HRESULT RepackNv12(IMFSample* s, UINT32 w, UINT32 h, const Nv12Layout& l, ComPtr<IMFSample>& out) {
+    ComPtr<IMFMediaBuffer> in;
+    HRESULT hr = s->ConvertToContiguousBuffer(&in);
+    if (FAILED(hr)) return hr;
+    LONG pitch = l.stride > 0 ? l.stride : (LONG)w;
+    UINT32 rows = std::max(l.rows, h);
+    BYTE* p = nullptr;
+    DWORD len = 0;
+    ComPtr<IMF2DBuffer> in2d;
+    bool locked2d = SUCCEEDED(in.As(&in2d)) && SUCCEEDED(in2d->Lock2D(&p, &pitch));
+    if (!locked2d && FAILED(hr = in->Lock(&p, nullptr, &len))) return hr;
+    if (pitch <= 0) pitch = (LONG)w;
+    if (!locked2d && (DWORD)pitch * rows * 3 / 2 > len) rows = h;  // buffer sem preenchimento
+    // Já compacto: usa a amostra como está.
+    if (pitch == (LONG)w && rows == h) {
+        locked2d ? in2d->Unlock2D() : in->Unlock();
+        out = s;
+        return S_OK;
+    }
+    const DWORD size = w * h * 3 / 2;
+    ComPtr<IMFMediaBuffer> buf;
+    hr = MFCreateMemoryBuffer(size, &buf);
+    BYTE* q = nullptr;
+    if (SUCCEEDED(hr)) hr = buf->Lock(&q, nullptr, nullptr);
+    if (SUCCEEDED(hr)) {
+        for (UINT32 y = 0; y < h; ++y) memcpy(q + y * w, p + y * pitch, w);
+        const BYTE* uv = p + pitch * rows;
+        for (UINT32 y = 0; y < h / 2; ++y) memcpy(q + w * h + y * w, uv + y * pitch, w);
+        buf->Unlock();
+        buf->SetCurrentLength(size);
+    }
+    locked2d ? in2d->Unlock2D() : in->Unlock();
+    if (FAILED(hr)) return hr;
+    ComPtr<IMFSample> ns;
+    if (FAILED(hr = MFCreateSample(&ns))) return hr;
+    s->CopyAllItems(ns.Get());  // atributos (ex.: CleanPoint)
+    ns->AddBuffer(buf.Get());
+    LONGLONG t = 0;
+    if (SUCCEEDED(s->GetSampleTime(&t))) ns->SetSampleTime(t);
+    if (SUCCEEDED(s->GetSampleDuration(&t))) ns->SetSampleDuration(t);
+    out = ns;
     return S_OK;
 }
 
@@ -546,6 +612,16 @@ static HRESULT ExportClip(const std::wstring& src, const std::wstring& dst, doub
     PropVariantClear(&pos);
     if (FAILED(hr)) return hr;
 
+    // Tamanho que o encoder recebe (o da exibição) e o layout real de cada quadro decodificado.
+    UINT32 vw = 0, vh = 0;
+    Nv12Layout layout;
+    if (hasV) {
+        ComPtr<IMFMediaType> in;
+        reader->GetCurrentMediaType(vIdx, &in);
+        MFGetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, &vw, &vh);
+        layout = ReadNv12Layout(reader.Get(), vIdx);
+    }
+
     bool vDone = !hasV, aDone = !hasA;
     int lastPct = -1;
     while (!(vDone && aDone)) {
@@ -561,6 +637,7 @@ static HRESULT ExportClip(const std::wstring& src, const std::wstring& dst, doub
         const DWORD outIdx = isV ? vOut : aOut;
         if (done) continue;
         if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) { done = true; continue; }
+        if (isV && (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)) layout = ReadNv12Layout(reader.Get(), vIdx);
         if (flags & MF_SOURCE_READERF_STREAMTICK) {
             if (ts >= A && ts < B) writer->SendStreamTick(outIdx, ts - A);
         }
@@ -579,6 +656,7 @@ static HRESULT ExportClip(const std::wstring& src, const std::wstring& dst, doub
             ts = A;
         }
         s->SetSampleTime(ts - A);
+        if (isV && FAILED(hr = RepackNv12(s.Get(), vw, vh, layout, s))) return hr;
         hr = writer->WriteSample(outIdx, s.Get());
         if (FAILED(hr)) return hr;
         if (isV || !hasV) {
